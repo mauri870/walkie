@@ -1,0 +1,6 @@
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+rustflags = ["-C", "link-args=-Wl,--kill-at"]
+
+[env]
+CMAKE = { value = ".cargo/cmake-wrap.sh", force = true, relative = true }
