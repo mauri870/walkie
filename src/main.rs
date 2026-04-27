@@ -12,9 +12,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait};
 use iroh::{Endpoint, NodeId, SecretKey};
+use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
 
-use tui::{LogBuffer, run_tui};
+use tui::run_tui;
 use transport::handle_conn;
 
 // -- Shared constants and types --
@@ -27,6 +28,7 @@ pub(crate) const MAX_LOG_LINES: usize = 200;
 
 pub(crate) type AmpHistory = Arc<Mutex<VecDeque<u64>>>;
 pub(crate) type PlaybackBuf = Arc<Mutex<VecDeque<f32>>>;
+pub(crate) type ChatBuffer = Arc<Mutex<VecDeque<String>>>;
 
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
@@ -97,11 +99,19 @@ fn load_or_create_secret_key() -> Result<SecretKey> {
 async fn main() -> Result<()> {
     let args = parse_args()?;
 
-    let log_buffer = LogBuffer::new();
+    let log_path = dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("walkie")
+        .join("walkie.log");
+    std::fs::create_dir_all(log_path.parent().unwrap())?;
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
     tracing_subscriber::fmt()
         .compact()
         .with_ansi(false)
-        .with_writer(log_buffer.clone())
+        .with_writer(Mutex::new(log_file))
         .with_env_filter(EnvFilter::new("warn,iroh_net_report=error"))
         .init();
 
@@ -133,6 +143,8 @@ async fn main() -> Result<()> {
     let ping_us = Arc::new(AtomicU64::new(0));
     let mic_amp: AmpHistory = Arc::new(Mutex::new(VecDeque::new()));
     let audio_amp: AmpHistory = Arc::new(Mutex::new(VecDeque::new()));
+    let chat_in: ChatBuffer = Arc::new(Mutex::new(VecDeque::new()));
+    let (chat_out_tx, _) = broadcast::channel::<String>(32);
 
     // Accept loop
     tokio::spawn({
@@ -143,6 +155,8 @@ async fn main() -> Result<()> {
         let audio_amp = audio_amp.clone();
         let input_device = args.input_device.clone();
         let output_device = args.output_device.clone();
+        let chat_in = chat_in.clone();
+        let chat_out_tx = chat_out_tx.clone();
         async move {
             loop {
                 match endpoint.accept().await {
@@ -154,10 +168,13 @@ async fn main() -> Result<()> {
                             let audio_amp = audio_amp.clone();
                             let input_device = input_device.clone();
                             let output_device = output_device.clone();
+                            let chat_in = chat_in.clone();
+                            let chat_out_tx = chat_out_tx.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = handle_conn(
                                     conn, ptt, ping_us, mic_amp, audio_amp,
                                     input_device, output_device,
+                                    chat_in, chat_out_tx,
                                 )
                                 .await
                                 {
@@ -198,9 +215,12 @@ async fn main() -> Result<()> {
         let ping_us = ping_us.clone();
         let mic_amp = mic_amp.clone();
         let audio_amp = audio_amp.clone();
+        let chat_in = chat_in.clone();
+        let chat_out_tx = chat_out_tx.clone();
         std::thread::spawn(move || {
             run_tui(
-                log_buffer,
+                chat_in,
+                chat_out_tx,
                 ptt,
                 ptt_last,
                 ping_us,
@@ -223,6 +243,8 @@ async fn main() -> Result<()> {
         let audio_amp = audio_amp.clone();
         let input_device = args.input_device.clone();
         let output_device = args.output_device.clone();
+        let chat_in = chat_in.clone();
+        let chat_out_tx = chat_out_tx.clone();
         tokio::spawn(async move {
             let mut delay = Duration::from_secs(2);
             loop {
@@ -231,6 +253,7 @@ async fn main() -> Result<()> {
                         tokio::spawn(handle_conn(
                             conn, ptt, ping_us, mic_amp, audio_amp,
                             input_device, output_device,
+                            chat_in, chat_out_tx,
                         ));
                         break;
                     }

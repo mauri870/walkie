@@ -1,7 +1,6 @@
-use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 use std::time::Duration;
 
@@ -19,55 +18,18 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline},
     Terminal,
 };
+use tokio::sync::broadcast;
 
-use crate::{now_ms, AmpHistory, MAX_LOG_LINES};
-
-// -- Log capture --
-
-#[derive(Clone)]
-pub(crate) struct LogBuffer(pub(crate) Arc<Mutex<VecDeque<String>>>);
-
-impl LogBuffer {
-    pub(crate) fn new() -> Self {
-        Self(Arc::new(Mutex::new(VecDeque::new())))
-    }
-}
-
-pub(crate) struct LogWriter(LogBuffer);
-
-impl std::io::Write for LogWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if let Ok(s) = std::str::from_utf8(buf) {
-            for line in s.lines() {
-                if !line.is_empty() {
-                    let mut logs = self.0 .0.lock().unwrap();
-                    if logs.len() >= MAX_LOG_LINES {
-                        logs.pop_front();
-                    }
-                    logs.push_back(line.to_string());
-                }
-            }
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
-    type Writer = LogWriter;
-    fn make_writer(&'a self) -> Self::Writer {
-        LogWriter(self.clone())
-    }
-}
-
-// -- TUI --
+use crate::{now_ms, AmpHistory, ChatBuffer, MAX_LOG_LINES};
 
 enum Screen {
     Connect,
     Main,
+}
+
+enum InputMode {
+    Ptt,
+    Message,
 }
 
 fn centered_rect(area: Rect, width_pct: u16, height: u16) -> Rect {
@@ -91,7 +53,8 @@ fn centered_rect(area: Rect, width_pct: u16, height: u16) -> Rect {
 }
 
 pub(crate) fn run_tui(
-    logs: LogBuffer,
+    chat_in: ChatBuffer,
+    chat_out_tx: broadcast::Sender<String>,
     ptt: Arc<AtomicBool>,
     ptt_last: Arc<AtomicU64>,
     ping_us: Arc<AtomicU64>,
@@ -113,8 +76,10 @@ pub(crate) fn run_tui(
     let mut peer_id_tx = Some(peer_id_tx);
 
     let mut screen = Screen::Connect;
+    let mut input_mode = InputMode::Ptt;
     let mut connect_input = String::new();
     let mut connect_error: Option<String> = None;
+    let mut chat_input = String::new();
 
     loop {
         let _ = terminal.draw(|frame| {
@@ -130,7 +95,9 @@ pub(crate) fn run_tui(
                 Screen::Main => draw_main(
                     frame,
                     area,
-                    &logs,
+                    &chat_in,
+                    &chat_input,
+                    &input_mode,
                     &ptt,
                     &ping_us,
                     &mic_amp,
@@ -157,7 +124,17 @@ pub(crate) fn run_tui(
                         }
                     }
                     Screen::Main => {
-                        if handle_main_key(key, &ptt, &ptt_last, &mut shutdown_tx) {
+                        let quit = handle_main_key(
+                            key,
+                            &mut input_mode,
+                            &mut chat_input,
+                            &chat_in,
+                            &chat_out_tx,
+                            &ptt,
+                            &ptt_last,
+                            &mut shutdown_tx,
+                        );
+                        if quit {
                             break;
                         }
                     }
@@ -222,10 +199,13 @@ fn draw_connect(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_main(
     frame: &mut ratatui::Frame,
     area: Rect,
-    logs: &LogBuffer,
+    chat_in: &ChatBuffer,
+    chat_input: &str,
+    input_mode: &InputMode,
     ptt: &Arc<AtomicBool>,
     ping_us: &Arc<AtomicU64>,
     mic_amp: &AmpHistory,
@@ -235,28 +215,67 @@ fn draw_main(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),
+            Constraint::Min(5),
             Constraint::Length(5),
             Constraint::Length(5),
             Constraint::Length(4),
         ])
         .split(area);
 
-    // Log panel
-    let log_height = chunks[0].height.saturating_sub(2) as usize;
+    // Chat block with embedded input at the bottom
+    let mode_label = match input_mode {
+        InputMode::Ptt => "PTT",
+        InputMode::Message => "MSG",
+    };
+    let chat_block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Chat [{mode_label}] "));
+    let chat_inner = chat_block.inner(chunks[0]);
+    frame.render_widget(chat_block, chunks[0]);
+
+    // Split inner area: messages | separator | input line
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(chat_inner);
+
+    let msg_height = inner[0].height as usize;
     let items: Vec<ListItem> = {
-        let log_lines = logs.0.lock().unwrap();
-        let skip = log_lines.len().saturating_sub(log_height);
-        log_lines
+        let messages = chat_in.lock().unwrap();
+        let skip = messages.len().saturating_sub(msg_height);
+        messages
             .iter()
             .skip(skip)
             .map(|l| ListItem::new(l.clone()))
             .collect()
     };
+    frame.render_widget(List::new(items), inner[0]);
+
+    let sep_width = inner[1].width as usize;
     frame.render_widget(
-        List::new(items).block(Block::default().borders(Borders::ALL).title(" Logs ")),
-        chunks[0],
+        Paragraph::new(Span::styled(
+            "─".repeat(sep_width),
+            Style::default().fg(Color::DarkGray),
+        )),
+        inner[1],
     );
+
+    let input_line = match input_mode {
+        InputMode::Message => Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Yellow)),
+            Span::raw(chat_input.to_owned()),
+            Span::styled("█", Style::default().fg(Color::Yellow)),
+        ]),
+        InputMode::Ptt => Line::from(Span::styled(
+            "> Tab: enter message mode",
+            Style::default().fg(Color::DarkGray),
+        )),
+    };
+    frame.render_widget(Paragraph::new(input_line), inner[2]);
 
     // Mic sparkline
     let mic_data: Vec<u64> = mic_amp.lock().unwrap().iter().copied().collect();
@@ -285,12 +304,13 @@ fn draw_main(
     } else {
         ("● LISTENING", Style::default().fg(Color::Green))
     };
+    let hints = match input_mode {
+        InputMode::Ptt => "Tab: message mode   SPACE: push to talk   q / ctrl+c: quit",
+        InputMode::Message => "Tab: PTT mode   Enter: send   ctrl+c: quit",
+    };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled(
-                "SPACE: push to talk   q / ctrl+c: quit",
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(Span::styled(hints, Style::default().fg(Color::DarkGray))),
             Line::from(vec![
                 Span::styled(ptt_label, ptt_style),
                 Span::raw(format!("  │  Node: {node_id}")),
@@ -368,38 +388,84 @@ fn handle_connect_key(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_main_key(
     key: crossterm::event::KeyEvent,
+    input_mode: &mut InputMode,
+    chat_input: &mut String,
+    chat_in: &ChatBuffer,
+    chat_out_tx: &broadcast::Sender<String>,
     ptt: &Arc<AtomicBool>,
     ptt_last: &Arc<AtomicU64>,
     shutdown_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> bool {
-    match key.code {
-        KeyCode::Char(' ') => {
+    match input_mode {
+        InputMode::Message => {
             if key.kind == KeyEventKind::Release {
-                ptt_last.store(0, Ordering::Relaxed);
-                ptt.store(false, Ordering::Relaxed);
-            } else {
-                ptt_last.store(now_ms(), Ordering::Relaxed);
-                ptt.store(true, Ordering::Relaxed);
+                return false;
+            }
+            match key.code {
+                KeyCode::Tab => *input_mode = InputMode::Ptt,
+                KeyCode::Enter => {
+                    let text = chat_input.trim().to_owned();
+                    if !text.is_empty() {
+                        let mut buf = chat_in.lock().unwrap();
+                        if buf.len() >= MAX_LOG_LINES {
+                            buf.pop_front();
+                        }
+                        buf.push_back(format!("[you] {text}"));
+                        drop(buf);
+                        let _ = chat_out_tx.send(text);
+                        chat_input.clear();
+                    }
+                }
+                KeyCode::Backspace => {
+                    chat_input.pop();
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(tx) = shutdown_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    return true;
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    chat_input.push(c);
+                }
+                _ => {}
             }
         }
-        KeyCode::Char('q') if key.kind != KeyEventKind::Release => {
-            if let Some(tx) = shutdown_tx.take() {
-                let _ = tx.send(());
+        InputMode::Ptt => {
+            match key.code {
+                KeyCode::Tab if key.kind != KeyEventKind::Release => {
+                    *input_mode = InputMode::Message;
+                }
+                KeyCode::Char(' ') => {
+                    if key.kind == KeyEventKind::Release {
+                        ptt_last.store(0, Ordering::Relaxed);
+                        ptt.store(false, Ordering::Relaxed);
+                    } else {
+                        ptt_last.store(now_ms(), Ordering::Relaxed);
+                        ptt.store(true, Ordering::Relaxed);
+                    }
+                }
+                KeyCode::Char('q') if key.kind != KeyEventKind::Release => {
+                    if let Some(tx) = shutdown_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    return true;
+                }
+                KeyCode::Char('c')
+                    if key.kind != KeyEventKind::Release
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    if let Some(tx) = shutdown_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    return true;
+                }
+                _ => {}
             }
-            return true;
         }
-        KeyCode::Char('c')
-            if key.kind != KeyEventKind::Release
-                && key.modifiers.contains(KeyModifiers::CONTROL) =>
-        {
-            if let Some(tx) = shutdown_tx.take() {
-                let _ = tx.send(());
-            }
-            return true;
-        }
-        _ => {}
     }
     false
 }
