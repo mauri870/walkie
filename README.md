@@ -17,7 +17,7 @@ walkie --list-devices
 
 On startup a connect screen is shown. Enter the peer's node ID to initiate a call, or press Enter with an empty field to listen for incoming connections.
 
-Your identity key is persisted at `~/.config/walkie/secret.key`. Logs are written to `~/.config/walkie/walkie.log`.
+Your identity key is persisted at `~/.config/walkie/secret.key`. Saved aliases are stored at `~/.config/walkie/aliases`. Logs are written to `~/.config/walkie/walkie.log`.
 
 ## Controls
 

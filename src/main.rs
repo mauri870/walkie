@@ -30,6 +30,13 @@ pub(crate) type AmpHistory = Arc<Mutex<VecDeque<u64>>>;
 pub(crate) type PlaybackBuf = Arc<Mutex<VecDeque<f32>>>;
 pub(crate) type ChatBuffer = Arc<Mutex<VecDeque<String>>>;
 
+pub(crate) struct Contact {
+    pub alias: String,
+    pub node_id: String,
+}
+
+pub(crate) type Contacts = Arc<Mutex<Vec<Contact>>>;
+
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -93,6 +100,53 @@ fn load_or_create_secret_key() -> Result<SecretKey> {
     }
 }
 
+// -- Contacts --
+
+fn contacts_path() -> std::path::PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("walkie")
+        .join("aliases")
+}
+
+fn load_contacts() -> Vec<Contact> {
+    let path = contacts_path();
+    if !path.exists() {
+        return Vec::new();
+    }
+    std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let (alias, node_id) = line.split_once('=')?;
+            let alias = alias.trim().to_owned();
+            let node_id = node_id.trim().to_owned();
+            if alias.is_empty() || node_id.is_empty() {
+                return None;
+            }
+            Some(Contact { alias, node_id })
+        })
+        .collect()
+}
+
+fn save_contacts(contacts: &[Contact]) {
+    let path = contacts_path();
+    let content = contacts
+        .iter()
+        .map(|c| format!("{}={}", c.alias, c.node_id))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = std::fs::write(path, content);
+}
+
+fn upsert_contact(contacts: &mut Vec<Contact>, alias: String, node_id: String) {
+    if let Some(c) = contacts.iter_mut().find(|c| c.node_id == node_id) {
+        c.alias = alias;
+    } else {
+        contacts.push(Contact { alias, node_id });
+    }
+}
+
 // -- Main --
 
 #[tokio::main]
@@ -145,6 +199,7 @@ async fn main() -> Result<()> {
     let audio_amp: AmpHistory = Arc::new(Mutex::new(VecDeque::new()));
     let chat_in: ChatBuffer = Arc::new(Mutex::new(VecDeque::new()));
     let (chat_out_tx, _) = broadcast::channel::<String>(32);
+    let contacts: Contacts = Arc::new(Mutex::new(load_contacts()));
 
     // Accept loop
     tokio::spawn({
@@ -157,6 +212,7 @@ async fn main() -> Result<()> {
         let output_device = args.output_device.clone();
         let chat_in = chat_in.clone();
         let chat_out_tx = chat_out_tx.clone();
+        let contacts = contacts.clone();
         async move {
             loop {
                 match endpoint.accept().await {
@@ -170,11 +226,19 @@ async fn main() -> Result<()> {
                             let output_device = output_device.clone();
                             let chat_in = chat_in.clone();
                             let chat_out_tx = chat_out_tx.clone();
+                            let contacts_ref = contacts.clone();
                             tokio::spawn(async move {
+                                let peer_alias = conn.remote_node_id().ok().and_then(|id| {
+                                    let id_str = id.to_string();
+                                    contacts_ref.lock().unwrap()
+                                        .iter()
+                                        .find(|c| c.node_id == id_str)
+                                        .map(|c| c.alias.clone())
+                                });
                                 if let Err(e) = handle_conn(
                                     conn, ptt, ping_us, mic_amp, audio_amp,
                                     input_device, output_device,
-                                    chat_in, chat_out_tx,
+                                    chat_in, chat_out_tx, peer_alias,
                                 )
                                 .await
                                 {
@@ -206,7 +270,7 @@ async fn main() -> Result<()> {
     });
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let (peer_id_tx, peer_id_rx) = tokio::sync::oneshot::channel::<Option<NodeId>>();
+    let (peer_id_tx, peer_id_rx) = tokio::sync::oneshot::channel::<Option<(NodeId, Option<String>)>>();
     let running = Arc::new(AtomicBool::new(true));
 
     let tui_thread = {
@@ -217,6 +281,7 @@ async fn main() -> Result<()> {
         let audio_amp = audio_amp.clone();
         let chat_in = chat_in.clone();
         let chat_out_tx = chat_out_tx.clone();
+        let contacts = contacts.clone();
         std::thread::spawn(move || {
             run_tui(
                 chat_in,
@@ -230,12 +295,18 @@ async fn main() -> Result<()> {
                 shutdown_tx,
                 running,
                 peer_id_tx,
+                contacts,
             );
         })
     };
 
     // Wait for peer ID from TUI, then connect
-    if let Ok(Some(peer_id)) = peer_id_rx.await {
+    if let Ok(Some((peer_id, peer_alias))) = peer_id_rx.await {
+        if let Some(alias) = &peer_alias {
+            let mut guard = contacts.lock().unwrap();
+            upsert_contact(&mut guard, alias.clone(), peer_id.to_string());
+            save_contacts(&guard);
+        }
         let endpoint = endpoint.clone();
         let ptt = ptt.clone();
         let ping_us = ping_us.clone();
@@ -253,7 +324,7 @@ async fn main() -> Result<()> {
                         tokio::spawn(handle_conn(
                             conn, ptt, ping_us, mic_amp, audio_amp,
                             input_device, output_device,
-                            chat_in, chat_out_tx,
+                            chat_in, chat_out_tx, peer_alias,
                         ));
                         break;
                     }

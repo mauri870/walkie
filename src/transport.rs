@@ -81,6 +81,7 @@ pub(crate) async fn handle_conn(
     output_device_name: Option<String>,
     chat_in: ChatBuffer,
     chat_out_tx: broadcast::Sender<String>,
+    peer_alias: Option<String>,
 ) -> Result<()> {
     let peer = conn.remote_node_id()?.fmt_short();
     info!("connected to {peer}");
@@ -88,7 +89,7 @@ pub(crate) async fn handle_conn(
     // Accept loop — reads stream type byte and routes to control or chat handler
     let transport = conn.clone();
     let chat_in_accept = chat_in.clone();
-    let peer_label = peer.clone();
+    let peer_label = peer_alias.unwrap_or_else(|| peer.clone());
     tokio::spawn(async move {
         loop {
             match transport.accept_bi().await {

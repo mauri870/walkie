@@ -20,7 +20,7 @@ use ratatui::{
 };
 use tokio::sync::broadcast;
 
-use crate::{now_ms, AmpHistory, ChatBuffer, MAX_LOG_LINES};
+use crate::{now_ms, AmpHistory, ChatBuffer, Contacts, MAX_LOG_LINES};
 
 enum Screen {
     Connect,
@@ -30,6 +30,17 @@ enum Screen {
 enum InputMode {
     Ptt,
     Message,
+}
+
+enum ConnectTab {
+    Dial,
+    Listen,
+}
+
+enum ConnectFocus {
+    NodeId,
+    Alias,
+    Contacts,
 }
 
 fn centered_rect(area: Rect, width_pct: u16, height: u16) -> Rect {
@@ -63,7 +74,8 @@ pub(crate) fn run_tui(
     node_id: String,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
     running: Arc<AtomicBool>,
-    peer_id_tx: tokio::sync::oneshot::Sender<Option<NodeId>>,
+    peer_id_tx: tokio::sync::oneshot::Sender<Option<(NodeId, Option<String>)>>,
+    contacts: Contacts,
 ) {
     terminal::enable_raw_mode().unwrap();
     let mut stdout = std::io::stdout();
@@ -77,7 +89,11 @@ pub(crate) fn run_tui(
 
     let mut screen = Screen::Connect;
     let mut input_mode = InputMode::Ptt;
-    let mut connect_input = String::new();
+    let mut connect_tab = ConnectTab::Dial;
+    let mut connect_node_id = String::new();
+    let mut connect_alias = String::new();
+    let mut connect_focus = ConnectFocus::NodeId;
+    let mut contact_selected: usize = 0;
     let mut connect_error: Option<String> = None;
     let mut chat_input = String::new();
 
@@ -85,13 +101,24 @@ pub(crate) fn run_tui(
         let _ = terminal.draw(|frame| {
             let area = frame.area();
             match screen {
-                Screen::Connect => draw_connect(
-                    frame,
-                    area,
-                    &connect_input,
-                    connect_error.as_deref(),
-                    &node_id,
-                ),
+                Screen::Connect => {
+                    let contacts_snap: Vec<(String, String)> = contacts.lock().unwrap()
+                        .iter()
+                        .map(|c| (c.alias.clone(), c.node_id.clone()))
+                        .collect();
+                    draw_connect(
+                        frame,
+                        area,
+                        &connect_node_id,
+                        &connect_alias,
+                        &connect_focus,
+                        &connect_tab,
+                        connect_error.as_deref(),
+                        &node_id,
+                        &contacts_snap,
+                        contact_selected,
+                    );
+                }
                 Screen::Main => draw_main(
                     frame,
                     area,
@@ -111,13 +138,22 @@ pub(crate) fn run_tui(
             if let Ok(Event::Key(key)) = event::read() {
                 match screen {
                     Screen::Connect => {
+                        let contacts_snap: Vec<(String, String)> = contacts.lock().unwrap()
+                            .iter()
+                            .map(|c| (c.alias.clone(), c.node_id.clone()))
+                            .collect();
                         handle_connect_key(
                             key,
-                            &mut connect_input,
+                            &mut connect_node_id,
+                            &mut connect_alias,
+                            &mut connect_focus,
+                            &mut connect_tab,
                             &mut connect_error,
                             &mut peer_id_tx,
                             &mut shutdown_tx,
                             &mut screen,
+                            &contacts_snap,
+                            &mut contact_selected,
                         );
                         if shutdown_tx.is_none() {
                             break;
@@ -151,46 +187,128 @@ pub(crate) fn run_tui(
     let _ = terminal::disable_raw_mode();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_connect(
     frame: &mut ratatui::Frame,
     area: Rect,
-    input: &str,
+    node_id_input: &str,
+    alias_input: &str,
+    focus: &ConnectFocus,
+    tab: &ConnectTab,
     error: Option<&str>,
     node_id: &str,
+    contacts: &[(String, String)],
+    contact_selected: usize,
 ) {
-    let popup = centered_rect(area, 70, 9);
-
-    let input_line = if let Some(err) = error {
-        Line::from(vec![
-            Span::styled("  Invalid ID: ", Style::default().fg(Color::Red)),
-            Span::raw(err.to_owned()),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("  > ", Style::default().fg(Color::Yellow)),
-            Span::raw(input.to_owned()),
-            Span::styled("█", Style::default().fg(Color::Yellow)),
-        ])
+    let visible = if matches!(tab, ConnectTab::Dial) { contacts.len().min(4) } else { 0 };
+    let popup_height = match tab {
+        ConnectTab::Dial => 13 + if visible > 0 { 1 + visible as u16 } else { 0 },
+        ConnectTab::Listen => 9,
     };
+    let popup = centered_rect(area, 72, popup_height);
 
-    let content = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Enter peer node ID to connect,",
-            Style::default().fg(Color::White),
-        )),
-        Line::from(Span::styled(
-            "  or press Enter to listen only:",
-            Style::default().fg(Color::White),
-        )),
-        Line::from(""),
-        input_line,
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  Your ID: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(node_id.to_owned(), Style::default().fg(Color::Cyan)),
-        ]),
+    let tab_bar = Line::from(vec![
+        Span::raw("  "),
+        if matches!(tab, ConnectTab::Dial) {
+            Span::styled("Connect", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::UNDERLINED))
+        } else {
+            Span::styled("Connect", Style::default().fg(Color::DarkGray))
+        },
+        Span::styled("   │   ", Style::default().fg(Color::DarkGray)),
+        if matches!(tab, ConnectTab::Listen) {
+            Span::styled("Listen", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::UNDERLINED))
+        } else {
+            Span::styled("Listen", Style::default().fg(Color::DarkGray))
+        },
+        Span::styled("                 Tab to switch", Style::default().fg(Color::DarkGray)),
+    ]);
+
+    let sep = "  ─────────────────────────────────────────────";
+    let your_id = Line::from(vec![
+        Span::styled("  Your ID: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(node_id.to_owned(), Style::default().fg(Color::Cyan)),
+    ]);
+
+    let mut content = vec![
+        tab_bar,
+        Line::from(Span::styled(sep, Style::default().fg(Color::DarkGray))),
     ];
+
+    match tab {
+        ConnectTab::Dial => {
+            let peer_label = if let Some(err) = error {
+                Line::from(vec![
+                    Span::styled("  Error: ", Style::default().fg(Color::Red)),
+                    Span::raw(err.to_owned()),
+                ])
+            } else {
+                Line::from(Span::styled("  Peer ID:", Style::default().fg(Color::White)))
+            };
+            let peer_input = match focus {
+                ConnectFocus::NodeId => Line::from(vec![
+                    Span::styled("  > ", Style::default().fg(Color::Yellow)),
+                    Span::raw(node_id_input.to_owned()),
+                    Span::styled("█", Style::default().fg(Color::Yellow)),
+                ]),
+                _ => Line::from(Span::styled(
+                    format!("  {}", node_id_input),
+                    if node_id_input.is_empty() { Style::default().fg(Color::DarkGray) } else { Style::default().fg(Color::White) },
+                )),
+            };
+            let alias_input_line = match focus {
+                ConnectFocus::Alias => Line::from(vec![
+                    Span::styled("  > ", Style::default().fg(Color::Yellow)),
+                    Span::raw(alias_input.to_owned()),
+                    Span::styled("█", Style::default().fg(Color::Yellow)),
+                ]),
+                _ => if alias_input.is_empty() {
+                    Line::from(Span::styled("  (optional)", Style::default().fg(Color::DarkGray)))
+                } else {
+                    Line::from(Span::raw(format!("  {}", alias_input)))
+                },
+            };
+            content.extend([
+                peer_label,
+                peer_input,
+                Line::from(""),
+                Line::from(Span::styled("  Save as:", Style::default().fg(Color::White))),
+                alias_input_line,
+                Line::from(""),
+                Line::from(Span::styled("  ↑↓: switch field   Enter: dial", Style::default().fg(Color::DarkGray))),
+            ]);
+            if visible > 0 {
+                content.push(Line::from(Span::styled(
+                    format!("{}  saved", sep),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                let start = if contact_selected >= 4 { contact_selected - 3 } else { 0 };
+                for (i, (alias, nid)) in contacts[start..start + visible].iter().enumerate() {
+                    let abs_i = start + i;
+                    let short_nid: String = nid.chars().take(16).collect();
+                    let is_sel = matches!(focus, ConnectFocus::Contacts) && abs_i == contact_selected;
+                    if is_sel {
+                        content.push(Line::from(Span::styled(
+                            format!("▶ {:<12} {}…", alias, short_nid),
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        )));
+                    } else {
+                        content.push(Line::from(Span::styled(
+                            format!("  {:<12} {}…", alias, short_nid),
+                            Style::default().fg(Color::White),
+                        )));
+                    }
+                }
+            }
+        }
+        ConnectTab::Listen => {
+            content.extend([
+                Line::from(""),
+                your_id,
+                Line::from(""),
+                Line::from(Span::styled("  Press Enter to start listening.", Style::default().fg(Color::DarkGray))),
+            ]);
+        }
+    }
 
     frame.render_widget(
         Paragraph::new(content)
@@ -332,44 +450,117 @@ fn draw_main(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_connect_key(
     key: crossterm::event::KeyEvent,
-    connect_input: &mut String,
+    node_id_input: &mut String,
+    alias_input: &mut String,
+    focus: &mut ConnectFocus,
+    tab: &mut ConnectTab,
     connect_error: &mut Option<String>,
-    peer_id_tx: &mut Option<tokio::sync::oneshot::Sender<Option<NodeId>>>,
+    peer_id_tx: &mut Option<tokio::sync::oneshot::Sender<Option<(NodeId, Option<String>)>>>,
     shutdown_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
     screen: &mut Screen,
+    contacts: &[(String, String)],
+    contact_selected: &mut usize,
 ) {
+    if !contacts.is_empty() {
+        *contact_selected = (*contact_selected).min(contacts.len() - 1);
+    }
     if key.kind == KeyEventKind::Release {
         return;
     }
     match key.code {
-        KeyCode::Enter => {
-            let trimmed = connect_input.trim().to_owned();
-            if trimmed.is_empty() {
-                if let Some(tx) = peer_id_tx.take() {
-                    let _ = tx.send(None);
+        KeyCode::Tab => {
+            *tab = match tab {
+                ConnectTab::Dial => ConnectTab::Listen,
+                ConnectTab::Listen => {
+                    *focus = ConnectFocus::NodeId;
+                    ConnectTab::Dial
                 }
-                *screen = Screen::Main;
-            } else {
-                match trimmed.parse::<NodeId>() {
-                    Ok(id) => {
-                        if let Some(tx) = peer_id_tx.take() {
-                            let _ = tx.send(Some(id));
-                        }
-                        *connect_error = None;
-                        connect_input.clear();
-                        *screen = Screen::Main;
+            };
+        }
+        KeyCode::Up if matches!(tab, ConnectTab::Dial) => {
+            match focus {
+                ConnectFocus::Contacts => {
+                    if *contact_selected > 0 {
+                        *contact_selected -= 1;
+                    } else {
+                        *focus = ConnectFocus::Alias;
                     }
-                    Err(e) => {
-                        *connect_error = Some(e.to_string());
-                        connect_input.clear();
+                }
+                ConnectFocus::Alias => { *focus = ConnectFocus::NodeId; }
+                ConnectFocus::NodeId => {}
+            }
+        }
+        KeyCode::Down if matches!(tab, ConnectTab::Dial) => {
+            match focus {
+                ConnectFocus::NodeId => { *focus = ConnectFocus::Alias; }
+                ConnectFocus::Alias => {
+                    if !contacts.is_empty() {
+                        *focus = ConnectFocus::Contacts;
+                    }
+                }
+                ConnectFocus::Contacts => {
+                    if !contacts.is_empty() && *contact_selected < contacts.len() - 1 {
+                        *contact_selected += 1;
                     }
                 }
             }
         }
-        KeyCode::Backspace => {
-            connect_input.pop();
+        KeyCode::Enter => match tab {
+            ConnectTab::Listen => {
+                if let Some(tx) = peer_id_tx.take() {
+                    let _ = tx.send(None);
+                }
+                *screen = Screen::Main;
+            }
+            ConnectTab::Dial => match focus {
+                ConnectFocus::Contacts => {
+                    if let Some((alias, nid)) = contacts.get(*contact_selected) {
+                        *node_id_input = nid.clone();
+                        *alias_input = alias.clone();
+                        *focus = ConnectFocus::NodeId;
+                    }
+                }
+                _ => {
+                    let trimmed = node_id_input.trim().to_owned();
+                    if trimmed.is_empty() {
+                        if let Some(tx) = peer_id_tx.take() {
+                            let _ = tx.send(None);
+                        }
+                        *screen = Screen::Main;
+                    } else {
+                        match trimmed.parse::<NodeId>() {
+                            Ok(id) => {
+                                let alias_opt = {
+                                    let a = alias_input.trim().to_owned();
+                                    if a.is_empty() { None } else { Some(a) }
+                                };
+                                if let Some(tx) = peer_id_tx.take() {
+                                    let _ = tx.send(Some((id, alias_opt)));
+                                }
+                                *connect_error = None;
+                                node_id_input.clear();
+                                alias_input.clear();
+                                *screen = Screen::Main;
+                            }
+                            Err(_) => {
+                                *connect_error = Some(
+                                    "not a valid node ID (expected 52-char base32)".into(),
+                                );
+                            }
+                        }
+                    }
+                }
+            },
+        },
+        KeyCode::Backspace if matches!(tab, ConnectTab::Dial) => {
+            match focus {
+                ConnectFocus::NodeId => { node_id_input.pop(); }
+                ConnectFocus::Alias => { alias_input.pop(); }
+                ConnectFocus::Contacts => {}
+            }
             *connect_error = None;
         }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -380,8 +571,15 @@ fn handle_connect_key(
                 let _ = tx.send(());
             }
         }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            connect_input.push(c);
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(tab, ConnectTab::Dial) =>
+        {
+            match focus {
+                ConnectFocus::NodeId => { node_id_input.push(c); }
+                ConnectFocus::Alias => { alias_input.push(c); }
+                ConnectFocus::Contacts => {}
+            }
             *connect_error = None;
         }
         _ => {}
