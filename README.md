@@ -15,18 +15,7 @@ walkie [--input-device <NAME>] [--output-device <NAME>]
 walkie --list-devices
 ```
 
-On startup a connect screen is shown. Enter the peer's node ID to initiate a call, or press Enter with an empty field to listen for incoming connections.
-
 Your identity key is persisted at `~/.config/walkie/secret.key`. Saved aliases are stored at `~/.config/walkie/aliases`. Logs are written to `~/.config/walkie/walkie.log`.
-
-## Controls
-
-| Key | Action |
-|-----|--------|
-| `Space` (hold) | Push to talk |
-| `Tab` | Toggle between PTT and chat mode |
-| `Enter` | Send chat message (chat mode) |
-| `q` / `Ctrl+C` | Quit |
 
 ## Building
 
