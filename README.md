@@ -15,7 +15,7 @@ walkie [--input-device <NAME>] [--output-device <NAME>]
 walkie --list-devices
 ```
 
-Your identity key is persisted at `~/.config/walkie/secret.key`. Saved aliases are stored at `~/.config/walkie/aliases`. Logs are written to `~/.config/walkie/walkie.log`.
+Your identity key is persisted at `~/.config/walkie/secret.key`. Saved contacts are stored at `~/.config/walkie/aliases`. Logs are written to `~/.config/walkie/walkie.log`.
 
 ## Building
 
