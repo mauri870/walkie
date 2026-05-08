@@ -73,7 +73,7 @@ impl Message {
 
 pub(crate) async fn handle_conn(
     conn: Connection,
-    ptt: Arc<AtomicBool>,
+    mic_on: Arc<AtomicBool>,
     ping_us: Arc<AtomicU64>,
     mic_amp: AmpHistory,
     audio_amp: AmpHistory,
@@ -194,7 +194,7 @@ pub(crate) async fn handle_conn(
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     {
         let play_buf = play_buf.clone();
-        let ptt = ptt.clone();
+        let mic_on = mic_on.clone();
         let mic_amp = mic_amp.clone();
         std::thread::spawn(move || {
             let host = cpal::default_host();
@@ -212,7 +212,7 @@ pub(crate) async fn handle_conn(
                     return;
                 }
             };
-            let _cap = match start_capture(&in_dev, ptt, mic_amp, cap_tx) {
+            let _cap = match start_capture(&in_dev, mic_on, mic_amp, cap_tx) {
                 Ok(s) => s,
                 Err(e) => {
                     warn!("capture start: {e}");

@@ -70,7 +70,7 @@ fn build_capture_stream<S: cpal::SizedSample + 'static>(
     config: &cpal::StreamConfig,
     channels: usize,
     to_f32: fn(S) -> f32,
-    ptt: Arc<std::sync::atomic::AtomicBool>,
+    mic_on: Arc<std::sync::atomic::AtomicBool>,
     mic_amp: AmpHistory,
     tx: tokio::sync::mpsc::Sender<Bytes>,
 ) -> Result<cpal::Stream> {
@@ -91,7 +91,7 @@ fn build_capture_stream<S: cpal::SizedSample + 'static>(
                 pcm_frame.copy_from_slice(&pcm_buf[..FRAME_SIZE]);
                 pcm_buf.drain(..FRAME_SIZE);
                 push_amp(&mic_amp, rms_amplitude(&pcm_frame));
-                if ptt.load(std::sync::atomic::Ordering::Relaxed) {
+                if mic_on.load(std::sync::atomic::Ordering::Relaxed) {
                     if let Ok(n) = encoder.encode_float(&pcm_frame, &mut enc_buf) {
                         let _ = tx.try_send(Bytes::copy_from_slice(&enc_buf[..n]));
                     }
@@ -105,7 +105,7 @@ fn build_capture_stream<S: cpal::SizedSample + 'static>(
 
 pub(crate) fn start_capture(
     device: &cpal::Device,
-    ptt: Arc<std::sync::atomic::AtomicBool>,
+    mic_on: Arc<std::sync::atomic::AtomicBool>,
     mic_amp: AmpHistory,
     tx: tokio::sync::mpsc::Sender<Bytes>,
 ) -> Result<cpal::Stream> {
@@ -116,14 +116,14 @@ pub(crate) fn start_capture(
 
     let stream = match fmt {
         cpal::SampleFormat::F32 => {
-            build_capture_stream::<f32>(device, &config, channels, |s| s, ptt, mic_amp, tx)
+            build_capture_stream::<f32>(device, &config, channels, |s| s, mic_on, mic_amp, tx)
         }
         cpal::SampleFormat::I16 => build_capture_stream::<i16>(
             device,
             &config,
             channels,
             |s| s as f32 / 32_768.0,
-            ptt,
+            mic_on,
             mic_amp,
             tx,
         ),
@@ -132,7 +132,7 @@ pub(crate) fn start_capture(
             &config,
             channels,
             |s| s as f32 / 2_147_483_648.0,
-            ptt,
+            mic_on,
             mic_amp,
             tx,
         ),
@@ -141,7 +141,7 @@ pub(crate) fn start_capture(
             &config,
             channels,
             |s| (s as f32 - 128.0) / 128.0,
-            ptt,
+            mic_on,
             mic_amp,
             tx,
         ),

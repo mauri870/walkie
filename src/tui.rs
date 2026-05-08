@@ -20,7 +20,7 @@ use ratatui::{
 };
 use tokio::sync::broadcast;
 
-use crate::{now_ms, AmpHistory, ChatBuffer, Contacts, MAX_LOG_LINES};
+use crate::{AmpHistory, ChatBuffer, Contacts, MAX_LOG_LINES};
 
 enum Screen {
     Connect,
@@ -28,7 +28,7 @@ enum Screen {
 }
 
 enum InputMode {
-    Ptt,
+    Voice,
     Message,
 }
 
@@ -66,8 +66,7 @@ fn centered_rect(area: Rect, width_pct: u16, height: u16) -> Rect {
 pub(crate) fn run_tui(
     chat_in: ChatBuffer,
     chat_out_tx: broadcast::Sender<String>,
-    ptt: Arc<AtomicBool>,
-    ptt_last: Arc<AtomicU64>,
+    mic_on: Arc<AtomicBool>,
     ping_us: Arc<AtomicU64>,
     mic_amp: AmpHistory,
     audio_amp: AmpHistory,
@@ -88,7 +87,7 @@ pub(crate) fn run_tui(
     let mut peer_id_tx = Some(peer_id_tx);
 
     let mut screen = Screen::Connect;
-    let mut input_mode = InputMode::Ptt;
+    let mut input_mode = InputMode::Voice;
     let mut connect_tab = ConnectTab::Dial;
     let mut connect_node_id = String::new();
     let mut connect_alias = String::new();
@@ -125,7 +124,7 @@ pub(crate) fn run_tui(
                     &chat_in,
                     &chat_input,
                     &input_mode,
-                    &ptt,
+                    &mic_on,
                     &ping_us,
                     &mic_amp,
                     &audio_amp,
@@ -166,8 +165,7 @@ pub(crate) fn run_tui(
                             &mut chat_input,
                             &chat_in,
                             &chat_out_tx,
-                            &ptt,
-                            &ptt_last,
+                            &mic_on,
                             &mut shutdown_tx,
                         );
                         if quit {
@@ -324,7 +322,7 @@ fn draw_main(
     chat_in: &ChatBuffer,
     chat_input: &str,
     input_mode: &InputMode,
-    ptt: &Arc<AtomicBool>,
+    mic_on: &Arc<AtomicBool>,
     ping_us: &Arc<AtomicU64>,
     mic_amp: &AmpHistory,
     audio_amp: &AmpHistory,
@@ -342,7 +340,7 @@ fn draw_main(
 
     // Chat block with embedded input at the bottom
     let mode_label = match input_mode {
-        InputMode::Ptt => "PTT",
+        InputMode::Voice => "VOICE",
         InputMode::Message => "MSG",
     };
     let chat_block = Block::default()
@@ -388,7 +386,7 @@ fn draw_main(
             Span::raw(chat_input.to_owned()),
             Span::styled("█", Style::default().fg(Color::Yellow)),
         ]),
-        InputMode::Ptt => Line::from(Span::styled(
+        InputMode::Voice => Line::from(Span::styled(
             "> Tab: enter message mode",
             Style::default().fg(Color::DarkGray),
         )),
@@ -416,21 +414,21 @@ fn draw_main(
     );
 
     // Status bar
-    let ptt_active = ptt.load(Ordering::Relaxed);
-    let (ptt_label, ptt_style) = if ptt_active {
-        ("● TRANSMITTING", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    let mic_active = mic_on.load(Ordering::Relaxed);
+    let (mic_label, mic_style) = if mic_active {
+        ("● MIC LIVE", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
     } else {
-        ("● LISTENING", Style::default().fg(Color::Green))
+        ("● MUTED", Style::default().fg(Color::DarkGray))
     };
     let hints = match input_mode {
-        InputMode::Ptt => "Tab: message mode   SPACE: push to talk   q / ctrl+c: quit",
-        InputMode::Message => "Tab: PTT mode   Enter: send   ctrl+c: quit",
+        InputMode::Voice => "Tab: chat   SPACE: mute/unmute   q / ctrl+c: quit",
+        InputMode::Message => "Tab: voice   Enter: send   ctrl+c: quit",
     };
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(hints, Style::default().fg(Color::DarkGray))),
             Line::from(vec![
-                Span::styled(ptt_label, ptt_style),
+                Span::styled(mic_label, mic_style),
                 Span::raw(format!("  │  Node: {node_id}")),
                 {
                     let us = ping_us.load(Ordering::Relaxed);
@@ -593,17 +591,19 @@ fn handle_main_key(
     chat_input: &mut String,
     chat_in: &ChatBuffer,
     chat_out_tx: &broadcast::Sender<String>,
-    ptt: &Arc<AtomicBool>,
-    ptt_last: &Arc<AtomicU64>,
+    mic_on: &Arc<AtomicBool>,
     shutdown_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> bool {
+    if key.kind == KeyEventKind::Release {
+        return false;
+    }
     match input_mode {
         InputMode::Message => {
-            if key.kind == KeyEventKind::Release {
-                return false;
-            }
             match key.code {
-                KeyCode::Tab => *input_mode = InputMode::Ptt,
+                KeyCode::Tab => {
+                    *input_mode = InputMode::Voice;
+                    mic_on.store(true, Ordering::Relaxed);
+                }
                 KeyCode::Enter => {
                     let text = chat_input.trim().to_owned();
                     if !text.is_empty() {
@@ -632,30 +632,23 @@ fn handle_main_key(
                 _ => {}
             }
         }
-        InputMode::Ptt => {
+        InputMode::Voice => {
             match key.code {
-                KeyCode::Tab if key.kind != KeyEventKind::Release => {
+                KeyCode::Tab => {
                     *input_mode = InputMode::Message;
+                    mic_on.store(false, Ordering::Relaxed);
                 }
                 KeyCode::Char(' ') => {
-                    if key.kind == KeyEventKind::Release {
-                        ptt_last.store(0, Ordering::Relaxed);
-                        ptt.store(false, Ordering::Relaxed);
-                    } else {
-                        ptt_last.store(now_ms(), Ordering::Relaxed);
-                        ptt.store(true, Ordering::Relaxed);
-                    }
+                    let current = mic_on.load(Ordering::Relaxed);
+                    mic_on.store(!current, Ordering::Relaxed);
                 }
-                KeyCode::Char('q') if key.kind != KeyEventKind::Release => {
+                KeyCode::Char('q') => {
                     if let Some(tx) = shutdown_tx.take() {
                         let _ = tx.send(());
                     }
                     return true;
                 }
-                KeyCode::Char('c')
-                    if key.kind != KeyEventKind::Release
-                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if let Some(tx) = shutdown_tx.take() {
                         let _ = tx.send(());
                     }

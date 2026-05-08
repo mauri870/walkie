@@ -7,7 +7,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait};
@@ -23,7 +23,6 @@ use transport::handle_conn;
 pub(crate) const SAMPLE_RATE: u32 = 48_000;
 pub(crate) const FRAME_SIZE: usize = 960; // 20 ms at 48 kHz
 pub(crate) const AMP_HISTORY_LEN: usize = 150;
-pub(crate) const PTT_TIMEOUT_MS: u64 = 300;
 pub(crate) const MAX_LOG_LINES: usize = 200;
 
 pub(crate) type AmpHistory = Arc<Mutex<VecDeque<u64>>>;
@@ -36,13 +35,6 @@ pub(crate) struct Contact {
 }
 
 pub(crate) type Contacts = Arc<Mutex<Vec<Contact>>>;
-
-pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 // -- Arg parsing --
 
@@ -192,8 +184,7 @@ async fn main() -> Result<()> {
 
     let node_id = endpoint.node_id();
 
-    let ptt = Arc::new(AtomicBool::new(false));
-    let ptt_last = Arc::new(AtomicU64::new(0));
+    let mic_on = Arc::new(AtomicBool::new(true));
     let ping_us = Arc::new(AtomicU64::new(0));
     let mic_amp: AmpHistory = Arc::new(Mutex::new(VecDeque::new()));
     let audio_amp: AmpHistory = Arc::new(Mutex::new(VecDeque::new()));
@@ -204,7 +195,7 @@ async fn main() -> Result<()> {
     // Accept loop
     tokio::spawn({
         let endpoint = endpoint.clone();
-        let ptt = ptt.clone();
+        let mic_on = mic_on.clone();
         let ping_us = ping_us.clone();
         let mic_amp = mic_amp.clone();
         let audio_amp = audio_amp.clone();
@@ -218,7 +209,7 @@ async fn main() -> Result<()> {
                 match endpoint.accept().await {
                     Some(incoming) => match incoming.await {
                         Ok(conn) => {
-                            let ptt = ptt.clone();
+                            let mic_on = mic_on.clone();
                             let ping_us = ping_us.clone();
                             let mic_amp = mic_amp.clone();
                             let audio_amp = audio_amp.clone();
@@ -236,7 +227,7 @@ async fn main() -> Result<()> {
                                         .map(|c| c.alias.clone())
                                 });
                                 if let Err(e) = handle_conn(
-                                    conn, ptt, ping_us, mic_amp, audio_amp,
+                                    conn, mic_on, ping_us, mic_amp, audio_amp,
                                     input_device, output_device,
                                     chat_in, chat_out_tx, peer_alias,
                                 )
@@ -254,28 +245,13 @@ async fn main() -> Result<()> {
         }
     });
 
-    // PTT watchdog
-    let ptt_wd = ptt.clone();
-    let ptt_last_wd = ptt_last.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(50));
-        loop {
-            interval.tick().await;
-            let t = ptt_last_wd.load(Ordering::Relaxed);
-            if t > 0 && now_ms().saturating_sub(t) >= PTT_TIMEOUT_MS {
-                ptt_last_wd.store(0, Ordering::Relaxed);
-                ptt_wd.store(false, Ordering::Relaxed);
-            }
-        }
-    });
-
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let (peer_id_tx, peer_id_rx) = tokio::sync::oneshot::channel::<Option<(NodeId, Option<String>)>>();
     let running = Arc::new(AtomicBool::new(true));
 
     let tui_thread = {
         let running = running.clone();
-        let ptt = ptt.clone();
+        let mic_on = mic_on.clone();
         let ping_us = ping_us.clone();
         let mic_amp = mic_amp.clone();
         let audio_amp = audio_amp.clone();
@@ -286,8 +262,7 @@ async fn main() -> Result<()> {
             run_tui(
                 chat_in,
                 chat_out_tx,
-                ptt,
-                ptt_last,
+                mic_on,
                 ping_us,
                 mic_amp,
                 audio_amp,
@@ -308,7 +283,7 @@ async fn main() -> Result<()> {
             save_contacts(&guard);
         }
         let endpoint = endpoint.clone();
-        let ptt = ptt.clone();
+        let mic_on = mic_on.clone();
         let ping_us = ping_us.clone();
         let mic_amp = mic_amp.clone();
         let audio_amp = audio_amp.clone();
@@ -322,7 +297,7 @@ async fn main() -> Result<()> {
                 match endpoint.connect(peer_id, iroh_roq::ALPN).await {
                     Ok(conn) => {
                         tokio::spawn(handle_conn(
-                            conn, ptt, ping_us, mic_amp, audio_amp,
+                            conn, mic_on, ping_us, mic_amp, audio_amp,
                             input_device, output_device,
                             chat_in, chat_out_tx, peer_alias,
                         ));
